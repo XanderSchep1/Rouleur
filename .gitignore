@@ -1,0 +1,7 @@
+# Build artifacts — not needed in the repo, rebuild locally via mac/build.sh
+mac/Rouleur.app/
+mac/Rouleur-mac.zip
+mac/icon_src/icon_1024_v*.png
+mac/icon_src/icon_1024_minimal.png
+Rouleur-windows.zip
+.DS_Store

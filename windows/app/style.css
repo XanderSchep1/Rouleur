@@ -394,6 +394,11 @@ button:disabled:hover { border-color: var(--border); background: var(--panel-2);
 
 /* ---------- Ride time / wind / cues ---------- */
 .accent-num { font-family: var(--font-display); font-size: 18px; color: var(--accent-2); letter-spacing: .5px; }
+.weather-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }
+.weather-chip {
+  font-size: 12px; font-weight: 600; color: var(--text); background: var(--bg-2);
+  border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px;
+}
 .wind-row { display: flex; align-items: center; gap: 14px; }
 .wind-arrow {
   flex: 0 0 auto; width: 38px; height: 38px; display: flex; align-items: center; justify-content: center;

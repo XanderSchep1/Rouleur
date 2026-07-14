@@ -164,7 +164,11 @@
       </section>
 
       <section class="panel wind-panel" id="windPanel" hidden>
-        <div class="elev-header"><span>🌬 Wind today</span><span id="windSummary" class="muted"></span></div>
+        <div class="elev-header"><span>🌤️ Weather</span><span id="windSummary" class="muted"></span></div>
+        <div class="weather-row">
+          <span id="weatherTemp" class="weather-chip"></span>
+          <span id="weatherRain" class="weather-chip"></span>
+        </div>
         <div class="wind-row">
           <div id="windArrow" class="wind-arrow" title="Direction the wind is blowing toward">↑</div>
           <div id="windBreakdown" class="wind-breakdown"></div>
@@ -179,6 +183,8 @@
       <section class="panel actions">
         <button id="exportBtn" class="primary" disabled>⬇︎ Export GPX</button>
         <button id="shareBtn" class="ghost" disabled>🔗 Share route</button>
+        <button id="importBtn" class="ghost">📂 Import GPX</button>
+        <input id="importFile" type="file" accept=".gpx,application/gpx+xml" hidden />
       </section>
 
       <section class="panel saved-panel">

@@ -39,6 +39,8 @@ const el = {
   surface: $("surface"),
   paceSlider: $("paceSlider"), paceLabel: $("paceLabel"), rideTime: $("rideTime"),
   windPanel: $("windPanel"), windSummary: $("windSummary"), windArrow: $("windArrow"), windBreakdown: $("windBreakdown"),
+  weatherTemp: $("weatherTemp"), weatherRain: $("weatherRain"),
+  importBtn: $("importBtn"), importFile: $("importFile"),
   cuePanel: $("cuePanel"), cueCount: $("cueCount"), cueList: $("cueList"),
   swipeModal: $("swipeModal"), swipeStack: $("swipeStack"), swipeProgress: $("swipeProgress"),
   swipeClose: $("swipeClose"), swipeSkip: $("swipeSkip"), swipeAdd: $("swipeAdd"),
@@ -490,22 +492,48 @@ function renderCues() {
     `<li><span class="cue-km">${c.km.toFixed(1)} km</span><span class="cue-arrow cue-${c.dir}">${c.dir === "right" ? "↱" : "↰"}</span>${c.text}</li>`).join("");
 }
 
-// --- Wind (Open-Meteo, no key) ---
+// --- Wind, temperature & rain chance (Open-Meteo, no key) — one request ---
 let windData = null, windCacheKey = null, windCacheAt = 0;
 const WIND_CACHE_MS = 4 * 60 * 1000; // shorter than the refresh interval so each tick genuinely re-fetches
 async function fetchWind(start) {
   const key = `${start.lat.toFixed(2)},${start.lon.toFixed(2)}`;
   const fresh = key === windCacheKey && (Date.now() - windCacheAt) < WIND_CACHE_MS;
   if (fresh && windData) return windData;
-  const url = `https://api.open-meteo.com/v1/forecast?latitude=${start.lat.toFixed(3)}&longitude=${start.lon.toFixed(3)}&current=wind_speed_10m,wind_direction_10m`;
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${start.lat.toFixed(3)}&longitude=${start.lon.toFixed(3)}` +
+    `&current=wind_speed_10m,wind_direction_10m,temperature_2m,precipitation,weather_code` +
+    `&hourly=precipitation_probability&forecast_days=1&timezone=auto`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`wind ${res.status}`);
   const d = await res.json();
-  windData = { speed: d.current.wind_speed_10m, dir: d.current.wind_direction_10m }; // dir = FROM
+  // Match the current hour in the hourly array for a rain-chance percentage
+  // (Open-Meteo's "current" block has no probability field, only hourly does).
+  let rainChance = null;
+  if (d.hourly && d.hourly.time) {
+    const hourKey = d.current.time.slice(0, 13) + ":00";
+    const idx = d.hourly.time.indexOf(hourKey);
+    if (idx >= 0) rainChance = d.hourly.precipitation_probability[idx];
+  }
+  windData = {
+    speed: d.current.wind_speed_10m, dir: d.current.wind_direction_10m, // dir = FROM
+    temp: d.current.temperature_2m, precipNow: d.current.precipitation,
+    code: d.current.weather_code, rainChance,
+  };
   windCacheKey = key;
   windCacheAt = Date.now();
   return windData;
 }
+
+// A small subset of WMO weather codes -> emoji + label, enough for a ride-planning glance.
+const WEATHER_CODE_MAP = {
+  0: ["☀️", "Clear"], 1: ["🌤️", "Mostly clear"], 2: ["⛅", "Partly cloudy"], 3: ["☁️", "Overcast"],
+  45: ["🌫️", "Fog"], 48: ["🌫️", "Fog"],
+  51: ["🌦️", "Light drizzle"], 53: ["🌦️", "Drizzle"], 55: ["🌧️", "Heavy drizzle"],
+  61: ["🌦️", "Light rain"], 63: ["🌧️", "Rain"], 65: ["🌧️", "Heavy rain"],
+  71: ["🌨️", "Light snow"], 73: ["🌨️", "Snow"], 75: ["❄️", "Heavy snow"],
+  80: ["🌦️", "Rain showers"], 81: ["🌧️", "Rain showers"], 82: ["⛈️", "Violent showers"],
+  95: ["⛈️", "Thunderstorm"], 96: ["⛈️", "Thunderstorm"], 99: ["⛈️", "Severe thunderstorm"],
+};
+const weatherInfo = (code) => WEATHER_CODE_MAP[code] || ["🌡️", "—"];
 function windBreakdown(coords, windDir) {
   let head = 0, tail = 0, cross = 0;
   for (let i = 1; i < coords.length; i++) {
@@ -606,6 +634,16 @@ async function updateWind() {
     `<span class="wind-head">🚴💨 ${b.head}% head</span>` +
     `<span class="wind-tail">💨🚴 ${b.tail}% tail</span>` +
     `<span class="wind-cross">↔ ${b.cross}% cross</span>`;
+
+  const [emoji, label] = weatherInfo(w.code);
+  el.weatherTemp.textContent = `${emoji} ${Math.round(w.temp)}°C · ${label}`;
+  if (w.rainChance != null) {
+    const heavy = w.rainChance >= 60 ? " ⚠️" : "";
+    el.weatherRain.textContent = `☔ ${w.rainChance}% chance of rain${heavy}`;
+    el.weatherRain.hidden = false;
+  } else {
+    el.weatherRain.hidden = true;
+  }
 }
 
 // --- Café & water stops along the route (Overpass) ---
@@ -1854,6 +1892,50 @@ function exportGPX() {
   toast(`Exported ${a.download} — import into your bike computer or app`, "success");
 }
 
+// ---------- GPX import ----------
+// Parses <trkpt> (preferred), falling back to <rtept> or <wpt> for GPX files
+// that only carry a route or waypoints rather than a recorded track.
+function parseGPX(text) {
+  const doc = new DOMParser().parseFromString(text, "application/xml");
+  if (doc.querySelector("parsererror")) throw new Error("that doesn't look like a valid GPX/XML file");
+
+  let pts = [...doc.querySelectorAll("trkpt")];
+  if (!pts.length) pts = [...doc.querySelectorAll("rtept")];
+  if (!pts.length) pts = [...doc.querySelectorAll("wpt")];
+  if (pts.length < 2) throw new Error("no track, route, or waypoint data found in this file");
+
+  const coords = pts.map((pt) => {
+    const lat = parseFloat(pt.getAttribute("lat"));
+    const lon = parseFloat(pt.getAttribute("lon"));
+    const eleEl = pt.querySelector("ele");
+    const ele = eleEl ? parseFloat(eleEl.textContent) : null;
+    return [lon, lat, ele];
+  }).filter((c) => Number.isFinite(c[0]) && Number.isFinite(c[1]));
+  if (coords.length < 2) throw new Error("couldn't read valid coordinates from this file");
+
+  const nameEl = doc.querySelector("trk > name, metadata > name, gpx > name");
+  return { coords, name: nameEl ? nameEl.textContent.trim() : null };
+}
+
+async function importGPXFile(file) {
+  try {
+    const text = await file.text();
+    const { coords, name } = parseGPX(text);
+    const first = coords[0], last = coords[coords.length - 1];
+    const isLoop = haversine(first[1], first[0], last[1], last[0]) < 50; // ~same point
+
+    applyLoadedRoute({
+      start: { lat: first[1], lon: first[0] },
+      waypoints: [{ lat: last[1], lon: last[0] }],
+      coords, loop: isLoop, name,
+    });
+    savePrefs();
+    toast(`Imported "${name || "route"}" · ${(state.distance / 1000).toFixed(1)} km — click the map to keep editing`, "success");
+  } catch (e) {
+    toast(`Couldn't import that GPX file — ${e.message}`, "error");
+  }
+}
+
 // ---------- Geocode search ----------
 async function search() {
   const q = el.search.value.trim();
@@ -2060,6 +2142,12 @@ function syncGenDist(value, from) {
 function bind() {
   el.export.addEventListener("click", exportGPX);
   el.share.addEventListener("click", shareRoute);
+  el.importBtn.addEventListener("click", () => el.importFile.click());
+  el.importFile.addEventListener("change", () => {
+    const file = el.importFile.files[0];
+    el.importFile.value = ""; // allow re-importing the same file later
+    if (file) importGPXFile(file);
+  });
   el.profile.addEventListener("change", recalcRoute);
   el.loop.addEventListener("change", () => { renderMarkers(); recalcRoute(); });
   el.searchBtn.addEventListener("click", search);

@@ -679,6 +679,45 @@ footer { margin-top: auto; }
 .error-title { font-family: var(--font-ui); font-weight: 700; font-size: 17px; color: var(--accent-2); margin: 2px 0 0; }
 .error-message { font-size: 13px; color: var(--muted); margin: 0; line-height: 1.4; }
 
+/* ---------- Account bar (sign-in status, top of sidebar) ---------- */
+.account-bar { display: flex; align-items: center; gap: 8px; padding: 2px; margin-top: -4px; }
+.account-btn { font-size: 12.5px; padding: 7px 12px; }
+.account-email {
+  font-size: 12.5px; font-weight: 600; color: var(--text); flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* ---------- Sign in / sign up modal ---------- */
+.auth-modal {
+  position: fixed; inset: 0; z-index: 3200; display: flex; align-items: center; justify-content: center;
+  background: rgba(12,8,5,.72); backdrop-filter: blur(2px);
+}
+.auth-panel {
+  position: relative; width: 320px; max-width: 90vw; background: var(--panel);
+  border: var(--border-w) solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 20px 20px 16px; display: flex; flex-direction: column; gap: 12px;
+}
+.auth-close {
+  position: absolute; top: 8px; right: 8px; width: 28px; height: 28px; padding: 0;
+  border-radius: 50%; font-size: 13px; display: flex; align-items: center; justify-content: center;
+}
+.auth-tabs { display: flex; gap: 4px; padding: 3px; background: var(--bg-2); border: 1.5px solid var(--border); border-radius: 999px; }
+.auth-tab {
+  flex: 1; padding: 7px 10px; border-radius: 999px; font-size: 12.5px; font-weight: 700;
+  background: transparent; border: none; color: var(--muted);
+}
+.auth-tab.active { background: var(--accent); color: #1c130d; }
+.auth-recovery-title { font-family: var(--font-ui); font-weight: 700; font-size: 15px; color: var(--accent-2); margin: 0; text-align: center; }
+.auth-form { display: flex; flex-direction: column; gap: 10px; }
+.auth-error { font-size: 12px; color: var(--red); margin: 0; line-height: 1.4; }
+.auth-note { font-size: 12px; color: var(--go); margin: 0; line-height: 1.4; }
+.linklike {
+  background: none; border: none; padding: 2px; font-size: 12px; color: var(--muted);
+  text-decoration: underline; align-self: center; cursor: pointer;
+}
+.linklike:hover { color: var(--accent-2); }
+.auth-hint { font-size: 11px; color: var(--muted); margin: 0; text-align: center; line-height: 1.4; }
+
 /* =====================================================================
    MODERN MODE — same kit colours (--accent/--go/etc. untouched), flatter
    and cleaner chrome: no diagonal textures/stripes, thin borders, soft

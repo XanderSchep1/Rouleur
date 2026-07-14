@@ -54,6 +54,8 @@
         <button class="mode-btn" data-mode="modern" title="Clean modern look">✨ Modern</button>
       </div>
 
+      <div class="account-bar" id="accountBar"></div>
+
       <section class="panel">
         <div class="panel-head">🚴 Your ride</div>
         <label class="field">
@@ -244,10 +246,37 @@
         <p class="error-message" id="errorMessage"></p>
       </div>
     </div>
+
+    <div id="authModal" class="auth-modal" hidden>
+      <div class="auth-panel">
+        <button id="authClose" class="auth-close" title="Close">✕</button>
+        <div class="auth-tabs" id="authTabsWrap" role="tablist">
+          <button type="button" class="auth-tab active" data-tab="signin">Sign in</button>
+          <button type="button" class="auth-tab" data-tab="signup">Sign up</button>
+        </div>
+        <p class="auth-recovery-title" id="authRecoveryTitle" hidden>🔑 Set a new password</p>
+        <form id="authForm" class="auth-form">
+          <label class="field" id="authEmailField">
+            <span>Email</span>
+            <input id="authEmail" type="email" autocomplete="email" required />
+          </label>
+          <label class="field">
+            <span id="authPasswordLabel">Password</span>
+            <input id="authPassword" type="password" autocomplete="current-password" minlength="6" required />
+          </label>
+          <p class="auth-error" id="authError" hidden></p>
+          <p class="auth-note" id="authNote" hidden></p>
+          <button type="submit" id="authSubmit" class="primary">Sign in</button>
+          <button type="button" id="authForgot" class="linklike">Forgot password?</button>
+        </form>
+        <p class="auth-hint">Your rides sync privately to your account only — no one else can see them.</p>
+      </div>
+    </div>
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
           integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

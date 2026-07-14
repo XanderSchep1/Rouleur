@@ -8,6 +8,16 @@ const OVERPASS = "https://overpass-api.de/api/interpreter";
 const STORE_KEY = "pedalplotter.routes.v1";
 const PREFS_KEY = "pedalplotter.prefs.v1";
 
+// Cloud sync (Supabase) — the anon key below is a public, client-safe key
+// (not a secret): access to data is enforced entirely by row-level-security
+// policies on the `routes` table, scoped to auth.uid(). Leave both blank to
+// run fully local/offline (no accounts, no login UI shown).
+const SUPABASE_URL = "";
+const SUPABASE_ANON_KEY = "";
+const supa = (window.supabase && SUPABASE_URL && SUPABASE_ANON_KEY)
+  ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+  : null;
+
 // ---------- State ----------
 const state = {
   waypoints: [],        // [{lat, lon}]
@@ -45,6 +55,12 @@ const el = {
   swipeModal: $("swipeModal"), swipeStack: $("swipeStack"), swipeProgress: $("swipeProgress"),
   swipeClose: $("swipeClose"), swipeSkip: $("swipeSkip"), swipeAdd: $("swipeAdd"),
   errorModal: $("errorModal"), errorMessage: $("errorMessage"), errorClose: $("errorClose"), crashCyclist: $("crashCyclist"),
+  accountBar: $("accountBar"),
+  authModal: $("authModal"), authClose: $("authClose"), authTabsWrap: $("authTabsWrap"),
+  authRecoveryTitle: $("authRecoveryTitle"), authForm: $("authForm"),
+  authEmailField: $("authEmailField"), authEmail: $("authEmail"),
+  authPasswordLabel: $("authPasswordLabel"), authPassword: $("authPassword"),
+  authError: $("authError"), authNote: $("authNote"), authSubmit: $("authSubmit"), authForgot: $("authForgot"),
 };
 
 let genOptions = [];      // generated loop options for the current run
@@ -1095,8 +1111,8 @@ async function fetchTowns(start, radiusM) {
 
 // ---------- Sightseeing points of interest ----------
 const SIGHT_EMOJI = {
-  viewpoint: "🔭", attraction: "⭐", artwork: "🎨", museum: "🏛️", gallery: "🖼️",
-  theme_park: "🎡", zoo: "🦁", castle: "🏰", monument: "🗿", memorial: "🕊️",
+  viewpoint: "🔭", attraction: "⭐", artwork: "🎨",
+  castle: "🏰", monument: "🗿", memorial: "🕊️",
   ruins: "🏚️", fort: "🏰", monastery: "⛪", manor: "🏰", archaeological_site: "🏺",
   city_gate: "🚪", tower: "🗼", peak: "⛰️", waterfall: "💧",
   windmill: "🌀", watermill: "⚙️", lighthouse: "🗼",
@@ -1104,10 +1120,12 @@ const SIGHT_EMOJI = {
 const sightEmoji = (kind) => SIGHT_EMOJI[kind] || "⭐";
 
 // How worth-a-look each kind is while riding (higher = keep when trimming clutter).
+// Only outdoor landmarks you can actually see from the road/path — no
+// museums, zoos, or other pay-to-enter indoor attractions.
 const SIGHT_WEIGHT = {
   windmill: 5, castle: 5, lighthouse: 5, viewpoint: 5, waterfall: 5, peak: 5,
   watermill: 4, ruins: 4, fort: 4, tower: 4, monastery: 4, manor: 4,
-  museum: 3, zoo: 3, theme_park: 3, attraction: 3, archaeological_site: 3,
+  attraction: 3, archaeological_site: 3,
   monument: 2, city_gate: 2, memorial: 1,
 };
 const sightWeight = (k) => SIGHT_WEIGHT[k] || 2;
@@ -1122,7 +1140,7 @@ async function fetchSights(start, radiusM) {
 
   const ll = `${start.lat.toFixed(5)},${start.lon.toFixed(5)}`;
   const q = `[out:json][timeout:25];(` +
-    `nwr(around:${r},${ll})["tourism"~"^(attraction|viewpoint|museum|theme_park|zoo)$"];` +
+    `nwr(around:${r},${ll})["tourism"~"^(attraction|viewpoint)$"];` +
     `nwr(around:${r},${ll})["historic"~"^(castle|monument|memorial|ruins|fort|monastery|manor|archaeological_site|city_gate|tower)$"];` +
     `nwr(around:${r},${ll})["natural"~"^(peak|waterfall)$"];` +
     `nwr(around:${r},${ll})["man_made"~"^(windmill|watermill|lighthouse)$"];` +
@@ -1411,7 +1429,179 @@ function setGen(msg, isError = false) {
   el.genStatus.classList.toggle("error", isError);
 }
 
-// ---------- Saved routes (localStorage) ----------
+// ---------- Account & cloud sync (Supabase) ----------
+// Signed-out visitors are unaffected: everything stays local-only, exactly as
+// before. Signing in mirrors the saved-routes list to a per-user Postgres
+// table (row-level-security scoped to auth.uid(), so nobody else can ever
+// read or write another account's rows) so routes follow you across devices.
+let currentUser = null;
+let authMode = "signin"; // "signin" | "signup" | "recovery"
+let cloudSyncedOnce = false;
+
+function rowToItem(row) {
+  return {
+    id: row.id, name: row.name, createdAt: new Date(row.created_at).getTime(),
+    profile: row.profile, loop: row.loop, distance: row.distance, gain: row.gain,
+    start: row.start, waypoints: row.waypoints, coords: row.coords,
+  };
+}
+function itemToRow(item, userId) {
+  return {
+    id: item.id, user_id: userId, name: item.name,
+    created_at: new Date(item.createdAt).toISOString(),
+    profile: item.profile, loop: !!item.loop, distance: item.distance, gain: item.gain,
+    start: item.start, waypoints: item.waypoints, coords: item.coords,
+  };
+}
+
+async function cloudUpload(item) {
+  if (!supa || !currentUser) return;
+  const { error } = await supa.from("routes").insert(itemToRow(item, currentUser.id));
+  if (error) toast(`Couldn't sync "${item.name}" to your account — ${error.message}`, "error");
+}
+async function cloudDelete(id) {
+  if (!supa || !currentUser) return;
+  const { error } = await supa.from("routes").delete().eq("id", id);
+  if (error) toast(`Couldn't remove that from your account — ${error.message}`, "error");
+}
+
+// Pulls the account's routes down, pushes up any local-only ones (e.g. saved
+// as a guest before signing in), then makes the merged cloud list the local
+// cache — cloud is the source of truth once you're signed in.
+async function syncRoutesFromCloud() {
+  if (!supa || !currentUser) return;
+  const { data, error } = await supa.from("routes").select("*").order("created_at", { ascending: false });
+  if (error) { toast(`Couldn't load your synced rides — ${error.message}`, "error"); return; }
+  let cloudItems = data.map(rowToItem);
+  const cloudIds = new Set(cloudItems.map((i) => i.id));
+  const localOnly = loadSaved().filter((i) => !cloudIds.has(i.id));
+  if (localOnly.length) {
+    for (const item of localOnly) await cloudUpload(item);
+    const refetch = await supa.from("routes").select("*").order("created_at", { ascending: false });
+    if (!refetch.error) cloudItems = refetch.data.map(rowToItem);
+  }
+  persistSaved(cloudItems);
+  renderSavedList();
+}
+
+function renderAccountBar() {
+  if (!supa) { el.accountBar.hidden = true; return; }
+  el.accountBar.hidden = false;
+  if (currentUser) {
+    el.accountBar.innerHTML = `
+      <span class="account-email" title="${currentUser.email}">👤 ${currentUser.email}</span>
+      <button id="signOutBtn" class="ghost mini">Sign out</button>`;
+    $("signOutBtn").addEventListener("click", signOut);
+  } else {
+    el.accountBar.innerHTML = `<button id="accountBtn" class="ghost account-btn">👤 Sign in to sync across devices</button>`;
+    $("accountBtn").addEventListener("click", () => openAuthModal("signin"));
+  }
+}
+
+function updateAuthFormMode() {
+  const recovery = authMode === "recovery";
+  el.authTabsWrap.hidden = recovery;
+  el.authRecoveryTitle.hidden = !recovery;
+  el.authEmailField.hidden = recovery;
+  el.authEmail.required = !recovery;
+  el.authPasswordLabel.textContent = recovery ? "New password" : "Password";
+  el.authPassword.setAttribute("autocomplete", recovery ? "new-password" : (authMode === "signup" ? "new-password" : "current-password"));
+  el.authSubmit.textContent = recovery ? "Set new password" : (authMode === "signup" ? "Create account" : "Sign in");
+  el.authForgot.hidden = authMode !== "signin";
+  document.querySelectorAll(".auth-tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === authMode));
+}
+
+function openAuthModal(mode) {
+  authMode = mode;
+  updateAuthFormMode();
+  el.authError.hidden = true;
+  el.authNote.hidden = true;
+  el.authModal.hidden = false;
+  (authMode === "recovery" ? el.authPassword : el.authEmail).focus();
+}
+function closeAuthModal() { el.authModal.hidden = true; }
+
+async function signOut() {
+  if (supa) await supa.auth.signOut();
+  // Clear the locally-cached (cloud-derived) list so a shared device doesn't
+  // keep showing the previous account's rides after sign-out.
+  persistSaved([]);
+  renderSavedList();
+  toast("Signed out — your rides are safely stored in your account.", "info");
+}
+
+function initAuth() {
+  if (!supa) { renderAccountBar(); return; }
+
+  document.querySelectorAll(".auth-tab").forEach((t) =>
+    t.addEventListener("click", () => { authMode = t.dataset.tab; updateAuthFormMode(); el.authError.hidden = true; el.authNote.hidden = true; }));
+
+  el.authClose.addEventListener("click", closeAuthModal);
+  el.authModal.addEventListener("click", (e) => { if (!e.target.closest(".auth-panel")) closeAuthModal(); });
+  el.authModal.addEventListener("mousedown", (e) => { if (!e.target.closest(".auth-panel")) e.preventDefault(); });
+
+  el.authForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    el.authError.hidden = true;
+    el.authNote.hidden = true;
+    el.authSubmit.disabled = true;
+    const email = el.authEmail.value.trim();
+    const password = el.authPassword.value;
+    try {
+      if (authMode === "recovery") {
+        const { error } = await supa.auth.updateUser({ password });
+        if (error) throw error;
+        toast("Password updated — you're signed in.", "success");
+        closeAuthModal();
+      } else if (authMode === "signup") {
+        const { data, error } = await supa.auth.signUp({ email, password });
+        if (error) throw error;
+        if (!data.session) {
+          el.authNote.textContent = "Check your inbox to confirm your email, then sign in.";
+          el.authNote.hidden = false;
+          authMode = "signin"; updateAuthFormMode();
+        } else {
+          closeAuthModal();
+        }
+      } else {
+        const { error } = await supa.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+        closeAuthModal();
+      }
+    } catch (err) {
+      el.authError.textContent = err.message || "Something went wrong.";
+      el.authError.hidden = false;
+    } finally {
+      el.authSubmit.disabled = false;
+    }
+  });
+
+  el.authForgot.addEventListener("click", async () => {
+    const email = el.authEmail.value.trim();
+    if (!email) { el.authError.textContent = "Enter your email first."; el.authError.hidden = false; return; }
+    el.authError.hidden = true;
+    const { error } = await supa.auth.resetPasswordForEmail(email, { redirectTo: location.origin + location.pathname });
+    if (error) { el.authError.textContent = error.message; el.authError.hidden = false; return; }
+    el.authNote.textContent = "Check your inbox for a password reset link.";
+    el.authNote.hidden = false;
+  });
+
+  supa.auth.onAuthStateChange((event, session) => {
+    if (event === "PASSWORD_RECOVERY") { openAuthModal("recovery"); return; }
+    currentUser = session ? session.user : null;
+    renderAccountBar();
+    if (currentUser && !cloudSyncedOnce) { cloudSyncedOnce = true; syncRoutesFromCloud(); }
+    if (!currentUser) cloudSyncedOnce = false;
+    if (event === "SIGNED_OUT") { persistSaved([]); renderSavedList(); }
+  });
+
+  supa.auth.getSession().then(({ data }) => {
+    currentUser = data.session ? data.session.user : null;
+    renderAccountBar();
+  });
+}
+
+// ---------- Saved routes (localStorage, mirrored to the cloud when signed in) ----------
 function loadSaved() {
   try { return JSON.parse(localStorage.getItem(STORE_KEY)) || []; }
   catch { return []; }
@@ -1445,6 +1635,7 @@ function saveCurrentRoute() {
   try { persistSaved(saved); }
   catch (e) { toast("Couldn't save — storage full? Delete some routes.", "error"); return; }
   renderSavedList();
+  if (currentUser) cloudUpload(item);
   toast(`Saved "${item.name}" · ${(item.distance / 1000).toFixed(1)} km`, "success");
   playRideAnimation();
 }
@@ -1584,6 +1775,7 @@ function deleteSavedRoute(id) {
   if (item && !confirm(`Delete "${item.name}"?`)) return;
   persistSaved(saved.filter((r) => r.id !== id));
   renderSavedList();
+  if (currentUser) cloudDelete(id);
   if (item) toast(`Deleted "${item.name}"`, "info");
 }
 
@@ -2172,6 +2364,7 @@ function bind() {
     if (e.key !== "Escape") return;
     if (!el.errorModal.hidden) hideCrash();
     else if (!el.swipeModal.hidden) closeStopSwipe(true);
+    else if (!el.authModal.hidden) closeAuthModal();
   });
 
   el.paceSlider.addEventListener("input", () => {
@@ -2221,6 +2414,7 @@ function bind() {
 
 initMap();
 bind();
+initAuth();
 applyPrefs();
 loadSharedRouteFromHash();
 renderSavedList();

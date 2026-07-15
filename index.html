@@ -56,6 +56,14 @@
 
       <div class="account-bar" id="accountBar"></div>
 
+      <section class="panel search-panel">
+        <div class="search-row">
+          <input id="search" type="text" placeholder="Jump to a place…" />
+          <button id="searchBtn" title="Search">🔍</button>
+        </div>
+        <button id="locateBtn" class="ghost">📍 Center on my location</button>
+      </section>
+
       <section class="panel">
         <div class="panel-head">🚴 Your ride</div>
         <label class="field">
@@ -69,6 +77,7 @@
             <option value="fastbike">Fast paved roads</option>
             <option value="fastbike-lowtraffic">Quiet country roads</option>
             <option value="safety">Safest / calmest</option>
+            <option value="cyclelanes">Cycling lanes only (strict) 🚲</option>
             <option value="trekking">Trekking / mixed</option>
             <option value="gravel">Gravel</option>
             <option value="shortest">Shortest</option>
@@ -124,12 +133,9 @@
         <div id="genResults" class="gen-results"></div>
       </section>
 
-      <section class="panel search-panel">
-        <div class="search-row">
-          <input id="search" type="text" placeholder="Jump to a place…" />
-          <button id="searchBtn" title="Search">🔍</button>
-        </div>
-        <button id="locateBtn" class="ghost">📍 Center on my location</button>
+      <section class="panel import-panel">
+        <button id="importBtn" class="ghost">📂 Or import an existing GPX file</button>
+        <input id="importFile" type="file" accept=".gpx,application/gpx+xml" hidden />
       </section>
 
       <section class="panel stats">
@@ -189,8 +195,6 @@
       <section class="panel actions">
         <button id="exportBtn" class="primary" disabled>⬇︎ Export GPX</button>
         <button id="shareBtn" class="ghost" disabled>🔗 Share route</button>
-        <button id="importBtn" class="ghost">📂 Import GPX</button>
-        <input id="importFile" type="file" accept=".gpx,application/gpx+xml" hidden />
       </section>
 
       <section class="panel saved-panel">

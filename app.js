@@ -22,12 +22,22 @@ const supa = (window.supabase && SUPABASE_URL && SUPABASE_ANON_KEY)
 const state = {
   waypoints: [],        // [{lat, lon}]
   routeCoords: [],      // [[lon, lat, ele], ...] from router
+  messages: null,       // BRouter per-way-change rows, for surface-colouring the line
   snapped: false,       // true when last route came from BRouter
   distance: 0,          // meters
   gain: 0, loss: 0,     // meters
 };
 
 let map, routeLayer, routeCasing, fallbackLayer, previewLayer, hoverMarker, sightLayer, startMarker, stopsLayer;
+let routeColorLayer;
+const baseLayers = {}; // street | satellite | terrain
+let activeBase = "street";
+let routeColorMode = "team"; // "team" | "gradient" | "surface"
+let nogoLayer;
+let nogoZones = []; // [{lat, lon, radius}] — areas BRouter must route around
+let nogoArmMode = false;
+const NOGO_RADIUS_M = 150;
+let midpointLayer;
 const markers = [];
 let routeSeq = 0;       // guards against out-of-order async responses
 let moveIndex = -1;     // index of a point armed for click-to-move, or -1
@@ -83,18 +93,32 @@ function setRoutePolyline(latlngs) {
 function initMap() {
   map = L.map("map", { zoomControl: true }).setView([52.3702, 4.8952], 13);
   // CARTO Voyager — cleaner, muted base map than raw OSM.
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
+  baseLayers.street = L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
     maxZoom: 20,
     subdomains: "abcd",
     detectRetina: true,
     attribution: '© OpenStreetMap contributors © CARTO',
   }).addTo(map);
+  baseLayers.satellite = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
+    maxZoom: 19,
+    attribution: "Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics",
+  });
+  baseLayers.terrain = L.tileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", {
+    maxZoom: 17,
+    subdomains: "abc",
+    attribution: "Map data: © OpenStreetMap contributors, SRTM · Map style: © OpenTopoMap (CC-BY-SA)",
+  });
+
+  L.control.scale({ imperial: false, position: "bottomleft" }).addTo(map);
+  addBasemapControl();
+  addRouteColorControl();
 
   // Layered so the route reads on any background: dark casing under, faint
   // hover-preview, then the bright route on top.
   previewLayer = L.polyline([], { color: "#2dd4bf", weight: 4, opacity: 0.75, dashArray: "2 7", lineCap: "round" }).addTo(map);
   routeCasing = L.polyline([], { color: "#10070a", weight: 9, opacity: 0.45, lineCap: "round", lineJoin: "round" }).addTo(map);
   routeLayer = L.polyline([], { color: "#ff6b35", weight: 5, opacity: 0.95, lineCap: "round", lineJoin: "round" }).addTo(map);
+  routeColorLayer = L.layerGroup().addTo(map); // gradient/surface multi-segment colouring, drawn over routeLayer
   fallbackLayer = L.polyline([], { color: "#ff6b35", weight: 3, opacity: 0.7, dashArray: "6 8" }).addTo(map);
   // Marker that tracks the elevation-profile cursor.
   hoverMarker = L.circleMarker([0, 0], {
@@ -105,6 +129,10 @@ function initMap() {
   sightLayer = L.layerGroup().addTo(map);
   // Café / water-stop markers.
   stopsLayer = L.layerGroup().addTo(map);
+  // Avoid-area (nogo) circles.
+  nogoLayer = L.layerGroup().addTo(map);
+  // Drag-to-insert "+" handles at the midpoint of each route segment.
+  midpointLayer = L.layerGroup().addTo(map);
 
   // Restore the last view/start if we have one; otherwise try geolocation.
   const prefs = loadPrefs();
@@ -120,8 +148,13 @@ function initMap() {
   startMarker.bindTooltip("Ride start — drag me to move it", { direction: "top", offset: [0, -46] });
   startMarker.on("dragend", () => { bounceStart(); savePrefs(); refreshWaypoints(); invalidateGenOptions(); });
 
-  // Map click: relocate a point if one is armed for "move", else add a point.
+  // Map click: place a nogo zone if armed, relocate a point if one is armed
+  // for "move", else add a point.
   map.on("click", (e) => {
+    if (nogoArmMode) {
+      addNogoZone(e.latlng.lat, e.latlng.lng);
+      return;
+    }
     if (moveIndex >= 0) {
       state.waypoints[moveIndex] = { lat: e.latlng.lat, lon: e.latlng.lng };
       moveIndex = -1;
@@ -157,6 +190,7 @@ function addMapEditControls() {
       `<button id="mapSave" class="map-save" title="Save this route">💾 Save</button>` +
       `<button id="mapStops" title="Find café &amp; water stops along your route">☕ Stops</button>` +
       `<button id="mapWind" class="active" title="Toggle the live wind map overlay">💨 Wind</button>` +
+      `<button id="mapNogo" title="Click a spot on the map to route around it">🚫 Avoid</button>` +
       `<button id="mapUndo" title="Undo last point (⌘/Ctrl+Z)">↩︎ Undo</button>` +
       `<button id="mapClear" title="Clear the route">🗑 Clear</button>`;
     L.DomEvent.disableClickPropagation(div);
@@ -164,12 +198,211 @@ function addMapEditControls() {
     L.DomEvent.on(div.querySelector("#mapSave"), "click", saveCurrentRoute);
     L.DomEvent.on(div.querySelector("#mapStops"), "click", findStops);
     L.DomEvent.on(div.querySelector("#mapWind"), "click", () => setWindOverlayEnabled(!windOverlayEnabled));
+    L.DomEvent.on(div.querySelector("#mapNogo"), "click", toggleNogoArmMode);
     L.DomEvent.on(div.querySelector("#mapUndo"), "click", undo);
     L.DomEvent.on(div.querySelector("#mapClear"), "click", clearAll);
     return div;
   };
   ctrl.addTo(map);
   updateEditControls();
+}
+
+// ---------- Nogo / avoid zones ----------
+// Arms "click the map to avoid this spot" mode; the next map click drops a
+// circle BRouter must route around (via the `nogos=` param), then disarms.
+function toggleNogoArmMode() {
+  nogoArmMode = !nogoArmMode;
+  const b = document.getElementById("mapNogo");
+  if (b) b.classList.toggle("active", nogoArmMode);
+  map.getContainer().classList.toggle("nogo-arming", nogoArmMode);
+  setStatus(nogoArmMode ? "Click the map to mark a spot to avoid — Esc to cancel." : "");
+}
+
+function addNogoZone(lat, lon) {
+  const zone = { lat, lon, radius: NOGO_RADIUS_M };
+  nogoZones.push(zone);
+  renderNogoZones();
+  nogoArmMode = false;
+  const b = document.getElementById("mapNogo");
+  if (b) b.classList.remove("active");
+  map.getContainer().classList.remove("nogo-arming");
+  recalcRoute();
+  invalidateGenOptions();
+  setStatus("Avoid zone added — routes will steer around it.");
+}
+
+function removeNogoZone(zone) {
+  nogoZones = nogoZones.filter((z) => z !== zone);
+  renderNogoZones();
+  recalcRoute();
+  invalidateGenOptions();
+}
+
+function renderNogoZones() {
+  nogoLayer.clearLayers();
+  nogoZones.forEach((zone) => {
+    const circle = L.circle([zone.lat, zone.lon], {
+      radius: zone.radius, color: "#d9483b", weight: 2, dashArray: "5 5",
+      fillColor: "#d9483b", fillOpacity: 0.15,
+    }).addTo(nogoLayer);
+    const div = L.DomUtil.create("div", "wp-popup");
+    div.innerHTML = `<button class="wp-pop-del">🗑 Remove avoid zone</button>`;
+    L.DomEvent.on(div.querySelector(".wp-pop-del"), "click", () => { circle.closePopup(); removeNogoZone(zone); });
+    circle.bindPopup(div, { className: "wp-popup-wrap", closeButton: false });
+  });
+}
+
+// Formats the current nogo zones for BRouter's `nogos=lon,lat,radius|...` param.
+function nogosParam() {
+  if (!nogoZones.length) return "";
+  return nogoZones.map((z) => `${z.lon.toFixed(6)},${z.lat.toFixed(6)},${z.radius}`).join("|");
+}
+
+// Street / satellite / terrain basemap switcher — stacked below the zoom control.
+function addBasemapControl() {
+  const ctrl = L.control({ position: "topleft" });
+  ctrl.onAdd = () => {
+    const div = L.DomUtil.create("div", "basemap-toggle");
+    div.innerHTML =
+      `<button data-base="street" class="active" title="Street map">🗺️</button>` +
+      `<button data-base="satellite" title="Satellite imagery">🛰️</button>` +
+      `<button data-base="terrain" title="Terrain / topographic">🏔️</button>`;
+    L.DomEvent.disableClickPropagation(div);
+    div.querySelectorAll("button").forEach((b) =>
+      L.DomEvent.on(b, "click", () => setBasemap(b.dataset.base)));
+    return div;
+  };
+  ctrl.addTo(map);
+}
+
+function setBasemap(name) {
+  if (!baseLayers[name] || name === activeBase) return;
+  map.removeLayer(baseLayers[activeBase]);
+  baseLayers[name].addTo(map);
+  activeBase = name;
+  document.querySelectorAll(".basemap-toggle button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.base === name));
+  scheduleSavePrefs();
+}
+
+// Route line colouring: team colour (default) | gradient (steepness) | surface.
+function addRouteColorControl() {
+  const ctrl = L.control({ position: "topleft" });
+  ctrl.onAdd = () => {
+    const div = L.DomUtil.create("div", "routecolor-toggle");
+    div.innerHTML =
+      `<button data-colormode="team" class="active" title="Team colour">🎨</button>` +
+      `<button data-colormode="gradient" title="Colour by steepness">📈</button>` +
+      `<button data-colormode="surface" title="Colour by road surface">🪨</button>`;
+    L.DomEvent.disableClickPropagation(div);
+    div.querySelectorAll("button").forEach((b) =>
+      L.DomEvent.on(b, "click", () => setRouteColorMode(b.dataset.colormode)));
+    return div;
+  };
+  ctrl.addTo(map);
+}
+
+function setRouteColorMode(mode) {
+  routeColorMode = mode;
+  document.querySelectorAll(".routecolor-toggle button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.colormode === mode));
+  applyRouteColoring();
+  scheduleSavePrefs();
+}
+
+function gradientColor(pct) {
+  const a = Math.abs(pct);
+  if (a < 2) return "#6bbf59";
+  if (a < 4) return "#c7d94a";
+  if (a < 6) return "#f0a02c";
+  if (a < 9) return "#e9642e";
+  if (a < 12) return "#d9483b";
+  return "#7a1f3d";
+}
+
+// One coloured sub-segment per consecutive coord pair, shaded by gradient %.
+function buildGradientSegments(coords) {
+  const segs = [];
+  for (let i = 1; i < coords.length; i++) {
+    const a = coords[i - 1], b = coords[i];
+    if (a[2] == null || b[2] == null) continue;
+    const dist = haversine(a[1], a[0], b[1], b[0]);
+    if (dist < 1) continue;
+    const grade = ((b[2] - a[2]) / dist) * 100;
+    segs.push({ latlngs: [[a[1], a[0]], [b[1], b[0]]], color: gradientColor(grade) });
+  }
+  return segs;
+}
+
+// BRouter's `messages` rows are a sparse subset of `coords` — one row per
+// point where the underlying way (and its tags) changes, not one per
+// polyline vertex. Match each row to the coords index it lands on so the
+// full (smooth) line can still be split into accurately-coloured stretches.
+function buildSurfaceSegments(coords, messages) {
+  if (!messages || messages.length < 2) return null;
+  const header = messages[0];
+  const wIdx = header.indexOf("WayTags");
+  const lonIdx = header.indexOf("Longitude");
+  const latIdx = header.indexOf("Latitude");
+  if (wIdx < 0 || lonIdx < 0 || latIdx < 0) return null;
+
+  const css = getComputedStyle(document.documentElement);
+  const pavedColor = css.getPropertyValue("--go").trim() || "#2f9e8f";
+  const unpavedColor = css.getPropertyValue("--accent").trim() || "#e9642e";
+  const unknownColor = css.getPropertyValue("--muted").trim() || "#b09a7c";
+  const classify = (tags) => {
+    const t = (tags || "").toLowerCase();
+    const m = t.match(/surface=([a-z_:]+)/);
+    const surf = m ? m[1] : null;
+    if (surf && /(asphalt|paved|concrete|paving_stones|sett|metal|wood|chipseal)/.test(surf)) return pavedColor;
+    if (surf && /(unpaved|gravel|fine_gravel|compacted|ground|dirt|earth|grass|sand|mud|pebblestone|cobblestone|rock|clay)/.test(surf)) return unpavedColor;
+    if (!surf && /highway=(motorway|trunk|primary|secondary|tertiary|residential|unclassified|living_street|service|cycleway)/.test(t)) return pavedColor;
+    return unknownColor;
+  };
+
+  let ci = 0;
+  const boundaries = []; // { idx, color }
+  for (let r = 1; r < messages.length; r++) {
+    const lon = parseFloat(messages[r][lonIdx]) / 1000000;
+    const lat = parseFloat(messages[r][latIdx]) / 1000000;
+    while (ci < coords.length - 1 &&
+           (Math.abs(coords[ci][0] - lon) > 0.00002 || Math.abs(coords[ci][1] - lat) > 0.00002)) {
+      ci++;
+    }
+    boundaries.push({ idx: ci, color: classify(messages[r][wIdx]) });
+  }
+  if (!boundaries.length) return null;
+
+  const segs = [];
+  let prevIdx = 0;
+  for (const b of boundaries) {
+    for (let i = Math.max(prevIdx, 1); i <= b.idx && i < coords.length; i++) {
+      segs.push({ latlngs: [[coords[i - 1][1], coords[i - 1][0]], [coords[i][1], coords[i][0]]], color: b.color });
+    }
+    prevIdx = b.idx + 1;
+  }
+  return segs;
+}
+
+// Recomputes the on-map route colouring for the current mode; called
+// whenever the route or the mode changes. "team" just shows the normal
+// single-colour routeLayer; the other modes overlay per-segment polylines
+// and hide routeLayer underneath.
+function applyRouteColoring() {
+  if (!routeColorLayer) return;
+  routeColorLayer.clearLayers();
+  if (routeColorMode === "team" || state.routeCoords.length < 2) {
+    routeLayer.setStyle({ opacity: 0.95 });
+    return;
+  }
+  const segs = routeColorMode === "gradient"
+    ? buildGradientSegments(state.routeCoords)
+    : buildSurfaceSegments(state.routeCoords, state.messages);
+  if (!segs || !segs.length) { routeLayer.setStyle({ opacity: 0.95 }); return; }
+  routeLayer.setStyle({ opacity: 0 });
+  segs.forEach((s) => L.polyline(s.latlngs, {
+    color: s.color, weight: 5, opacity: 0.95, lineCap: "round", lineJoin: "round",
+  }).addTo(routeColorLayer));
 }
 
 // Close (or re-open) the loop: route from the last point back to START.
@@ -377,6 +610,50 @@ function renderMarkers() {
   updateEditControls();
 }
 
+function midpointIcon() {
+  return L.divIcon({ className: "", html: `<div class="mid-marker">+</div>`, iconSize: [18, 18], iconAnchor: [9, 9] });
+}
+
+// Finds, for each point in `pts` (in order), the index of its nearest match
+// in `coords` — searching forward from the previous match so out-and-back
+// or looping routes don't get confused with an earlier close pass.
+function findCoordIndices(pts, coords) {
+  const indices = [];
+  let searchFrom = 0;
+  for (const p of pts) {
+    let bestIdx = searchFrom, bestDist = Infinity;
+    for (let i = searchFrom; i < coords.length; i++) {
+      const d = haversine(p.lat, p.lon, coords[i][1], coords[i][0]);
+      if (d < bestDist) { bestDist = d; bestIdx = i; }
+    }
+    indices.push(bestIdx);
+    searchFrom = bestIdx;
+  }
+  return indices;
+}
+
+// Small draggable "+" handles at the midpoint of each route segment — drop
+// one anywhere to insert a new waypoint right there, no need to only add at
+// the end. Positioned along the actual (road-snapped) line, not a straight
+// chord between waypoints, so it sits visibly on the route even on curves.
+function renderMidpoints() {
+  midpointLayer.clearLayers();
+  const pts = routingPoints();
+  if (pts.length < 2 || state.routeCoords.length < 2) return;
+  const indices = findCoordIndices(pts, state.routeCoords);
+  for (let k = 0; k < pts.length - 1; k++) {
+    const a = indices[k], b = indices[k + 1];
+    if (b <= a) continue; // degenerate match — segment too short to place a handle
+    const c = state.routeCoords[Math.floor((a + b) / 2)];
+    const marker = L.marker([c[1], c[0]], { icon: midpointIcon(), draggable: true, zIndexOffset: 400 }).addTo(midpointLayer);
+    marker.on("dragend", (e) => {
+      const ll = e.target.getLatLng();
+      state.waypoints.splice(k, 0, { lat: ll.lat, lon: ll.lng });
+      refreshWaypoints();
+    });
+  }
+}
+
 // Click a point → popup offering Move (relocate) or Delete.
 function bindWaypointPopup(marker, i) {
   const div = L.DomUtil.create("div", "wp-popup");
@@ -421,15 +698,20 @@ function clearAll() {
   clearTimeout(recalcTimer);
   state.waypoints = [];
   state.routeCoords = [];
+  state.messages = null;
   state.snapped = false;
   renderMarkers();
   setRoutePolyline([]);
   fallbackLayer.setLatLngs([]);
   clearSights();
   clearStops();
+  nogoZones = [];
+  renderNogoZones();
+  midpointLayer.clearLayers();
   if (el.swipeModal) el.swipeModal.hidden = true;
   renderSurface(null);
   renderElevation(); // also hides the map's climb-profile overlay
+  applyRouteColoring();
   updateRouteExtras();
   resetStats();
   setRouteAvailable(false);
@@ -446,16 +728,394 @@ function routingPoints() {
 }
 function pointCount() { return state.waypoints.length ? state.waypoints.length + 1 : 0; }
 
+// "Cycling lanes only (strict)" — a custom BRouter profile (based on their
+// stock "trekking" profile) with one rule added: any way that isn't a
+// dedicated cycleway/cycle lane or a cycling-priority street is excluded
+// outright (cost 10000) rather than just penalized. BRouter's public server
+// doesn't have this bundled, but does support submitting a one-off custom
+// profile script per https://github.com/abrensch/brouter — it's stored
+// server-side under a generated id and then referenced like any other named
+// profile. Uploaded lazily on first use and cached for the session.
+const CYCLELANES_PROFILE_ID = "cyclelanes";
+const CYCLELANES_BRF = `# *** Cycling lanes only (strict) ***
+# *** Based on BRouter's stock "trekking" profile, with one hard rule added:
+# *** any way that is NOT a dedicated cycleway/cycle lane/cycle-priority
+# *** street is excluded outright (cost 10000) rather than just penalized.
+# *** This means routing can fail ("no route found") in areas where dedicated
+# *** cycling infrastructure doesn't connect all the way through — that's
+# *** intentional for this strict mode.
+
+---context:global   # following code refers to global config
+
+assign validForBikes = true
+assign   allow_steps              = true
+assign   allow_ferries            = true
+assign   ignore_cycleroutes       = false
+assign   stick_to_cycleroutes     = true
+assign   use_proposed_cycleroutes = false
+assign   avoid_unsafe             = true
+assign   add_beeline              = false
+assign   consider_noise           = false
+assign   consider_river           = false
+assign   consider_forest          = false
+assign   consider_town            = false
+assign   consider_traffic         = false
+assign   consider_elevation       = true
+assign downhillcost       = 60
+assign downhillcutoff     = 1.5
+assign uphillcost         = 0
+assign uphillcutoff       = 1.5
+assign downhillcost       = if consider_elevation then downhillcost else 0
+assign uphillcost         = if consider_elevation then uphillcost else 0
+assign totalMass  = 90
+assign maxSpeed   = 45
+assign S_C_x      = 0.225
+assign C_r        = 0.01
+assign bikerPower = 100
+assign turnInstructionMode          = 1
+assign turnInstructionCatchingRange = 40
+assign turnInstructionRoundabouts   = true
+assign considerTurnRestrictions     = true
+assign correctMisplacedViaPoints = false
+assign correctMisplacedViaPointsDistance = 400
+assign processUnusedTags            = false
+
+---context:way   # following code refers to way-tags
+
+assign classifier_none  = 1
+assign classifier_ferry = 2
+
+assign any_cycleroute =
+  if not use_proposed_cycleroutes then
+     if      route_bicycle_icn=yes then true
+     else if route_bicycle_ncn=yes then true
+     else if route_bicycle_rcn=yes then true
+     else if route_bicycle_lcn=yes then true
+     else false
+  else
+     if      route_bicycle_icn=yes|proposed then true
+     else if route_bicycle_ncn=yes|proposed then true
+     else if route_bicycle_rcn=yes|proposed then true
+     else if route_bicycle_lcn=yes|proposed then true
+     else false
+
+assign nodeaccessgranted =
+     if any_cycleroute then true
+     else lcn=yes
+
+assign is_ldcr =
+     if ignore_cycleroutes then false
+     else any_cycleroute
+
+assign hasbikerouteoraccess =
+       or bicycle_road=yes or cyclestreet=yes or bicycle=yes|permissive|designated lcn=yes
+
+assign hascycleway = not
+  and ( or cycleway= cycleway=no|none ) and ( or cycleway:left= cycleway:left=no ) and ( or cycleway:right= cycleway:right=no ) ( or cycleway:both= cycleway:both=no )
+
+assign isbike = or hasbikerouteoraccess hascycleway
+
+#
+# STRICT MODE: true only for ways that are actual dedicated cycling
+# infrastructure or a cycling-priority street — not just any road bikes
+# are legally allowed on.
+#
+assign isdedicatedcycleway =
+  or highway=cycleway
+  or hascycleway
+  or ( and highway=path bicycle=designated )
+  or bicycle_road=yes
+     cyclestreet=yes
+
+assign ispaved = or surface=paved|asphalt|concrete|paving_stones|sett smoothness=excellent|good
+assign isunpaved = not or ispaved or ( and surface= smoothness= ) or surface=fine_gravel|cobblestone smoothness=intermediate|bad
+assign probablyGood = or ispaved and ( or isbike highway=footway ) not isunpaved
+
+assign turncost = if is_ldcr then 0
+                  else if junction=roundabout then 0
+                  else 90
+
+assign initialclassifier =
+     if route=ferry then classifier_ferry
+     else classifier_none
+
+assign initialcost =
+     if ( equal initialclassifier classifier_ferry ) then 10000
+     else 0
+
+assign defaultaccess =
+       if access= then not motorroad=yes
+       else if access=private|no then false
+       else true
+
+assign bikeaccess =
+       if bicycle= then
+       (
+         if bicycle_road=yes then true
+         else if vehicle= then ( if highway=footway then false else defaultaccess )
+         else not vehicle=private|no
+       )
+       else not bicycle=private|no|dismount|use_sidepath
+
+assign footaccess =
+       if bicycle=dismount then true
+       else if foot= then defaultaccess
+       else not foot=private|no|use_sidepath
+
+assign accesspenalty =
+       if bikeaccess then 0
+       else if footaccess then 4
+       else if any_cycleroute then 15
+       else if bicycle=use_sidepath then 25
+       else 10000
+
+assign badoneway =
+       if reversedirection=yes then
+         if oneway:bicycle=yes then true
+         else if oneway= then junction=roundabout
+         else oneway=yes|true|1
+       else oneway=-1
+
+assign onewaypenalty =
+       if ( badoneway ) then
+       (
+         if (
+           and hascycleway
+           or and cycleway:left=lane|track|shared_lane|share_busway
+                  cycleway:left:oneway=no|-1
+           or and cycleway:right=lane|track|shared_lane|share_busway
+                  cycleway:right:oneway=no|-1
+           or and cycleway:both=lane|track|shared_lane|share_busway
+                  or cycleway:left:oneway=no|-1
+                     cycleway:right:oneway=no|-1
+           or cycleway=opposite|opposite_lane|opposite_track
+           or cycleway:left=opposite|opposite_lane|opposite_track
+              cycleway:right=opposite|opposite_lane|opposite_track
+                                                             ) then 0
+         else if ( oneway:bicycle=no                         ) then 0
+         else if ( not footaccess                            ) then 100
+         else if ( junction=roundabout|circular              ) then 60
+         else if ( highway=primary|primary_link              ) then 50
+         else if ( highway=secondary|secondary_link          ) then 30
+         else if ( highway=tertiary|tertiary_link            ) then 20
+         else 4.0
+       )
+       else 0.0
+
+assign traffic_penalty
+   switch consider_traffic
+      switch estimated_traffic_class=       0
+      switch estimated_traffic_class=1|2    0.2
+      switch estimated_traffic_class=3      0.4
+      switch estimated_traffic_class=4      0.6
+      switch estimated_traffic_class=5      0.8
+      switch estimated_traffic_class=6|7    1 99 0
+
+assign noise_penalty
+   switch consider_noise
+     switch estimated_noise_class=  0
+     switch estimated_noise_class=1  0.3
+     switch estimated_noise_class=2  0.5
+     switch estimated_noise_class=3  0.8
+     switch estimated_noise_class=4  1.4
+     switch estimated_noise_class=5  1.7
+     switch estimated_noise_class=6  2 0 0
+
+assign no_river_penalty
+   switch consider_river
+     switch estimated_river_class=  2
+     switch estimated_river_class=1  1.3
+     switch estimated_river_class=2  1
+     switch estimated_river_class=3  0.7
+     switch estimated_river_class=4  0.4
+     switch estimated_river_class=5  0.1
+     switch estimated_river_class=6  0 99 0
+
+assign no_forest_penalty
+   switch consider_forest
+     switch estimated_forest_class=  1
+     switch estimated_forest_class=1  0.5
+     switch estimated_forest_class=2  0.4
+     switch estimated_forest_class=3  0.25
+     switch estimated_forest_class=4  0.15
+     switch estimated_forest_class=5  0.1
+     switch estimated_forest_class=6  0 99 0
+
+assign town_penalty
+   switch consider_town
+     switch estimated_town_class=  0
+     switch estimated_town_class=1  0.5
+     switch estimated_town_class=2  0.9
+     switch estimated_town_class=3  1.2
+     switch estimated_town_class=4  1.3
+     switch estimated_town_class=5  1.4
+     switch estimated_town_class=6  1.6 99 0
+
+assign isresidentialorliving = or highway=residential|living_street living_street=yes
+assign costfactor
+
+  #
+  # STRICT MODE: hard-exclude anything that isn't dedicated cycling
+  # infrastructure, before any of the usual scoring below runs.
+  #
+  if ( not isdedicatedcycleway ) then 10000
+
+  else if ( and highway= not route=ferry ) then 10000
+  else if ( highway=motorway|motorway_link          ) then   10000
+  else if ( highway=proposed|abandoned|construction ) then   10000
+  else min 9999
+
+  add town_penalty
+  add no_forest_penalty
+  add no_river_penalty
+  add noise_penalty
+  add traffic_penalty
+  add max onewaypenalty accesspenalty
+
+  if ( highway=steps ) then ( if allow_steps then 40 else 10000 )
+  else if ( route=ferry   ) then ( if allow_ferries then 5.67 else 10000 )
+  else if ( is_ldcr ) then 1
+  else
+  add ( if stick_to_cycleroutes then 0.5 else 0.05 )
+
+  if      ( highway=pedestrian                ) then ( if isbike then ( if hascycleway then 1.1 else 2.2 ) else 3 )
+  else if ( highway=bridleway                 ) then 5
+  else if ( highway=cycleway                  ) then 1
+  else if ( isresidentialorliving             ) then ( if isunpaved then 1.5 else 1.1 )
+  else if ( highway=service                   ) then ( if isunpaved then 1.6 else 1.3 )
+  else if ( highway=track|road|path|footway ) then
+  (
+    if      ( tracktype=grade1 ) then ( if probablyGood then 1.0 else 1.3 )
+    else if ( tracktype=grade2 ) then ( if probablyGood then 1.1 else 2.0 )
+    else if ( tracktype=grade3 ) then ( if probablyGood then 1.5 else 3.0 )
+    else if ( tracktype=grade4 ) then ( if probablyGood then 2.0 else 5.0 )
+    else if ( tracktype=grade5 ) then ( if probablyGood then 3.0 else 5.0 )
+    else                              ( if probablyGood then 1.0 else 5.0 )
+  )
+  else add ( if ( and avoid_unsafe not isbike ) then 2 else 0 )
+       if ( highway=trunk|trunk_link         ) then ( if isbike then 1.5 else 10  )
+  else if ( highway=primary|primary_link     ) then ( if isbike then 1.2 else  3  )
+  else if ( highway=secondary|secondary_link ) then ( if isbike then 1.1 else 1.6 )
+  else if ( highway=tertiary|tertiary_link   ) then ( if isbike then 1.0 else 1.4 )
+  else if ( highway=unclassified             ) then ( if isbike then 1.0 else 1.3 )
+  else 2.0
+
+assign priorityclassifier =
+  if      ( highway=motorway                          ) then  30
+  else if ( highway=motorway_link                     ) then  29
+  else if ( highway=trunk                             ) then  28
+  else if ( highway=trunk_link                        ) then  27
+  else if ( highway=primary                           ) then  26
+  else if ( highway=primary_link                      ) then  25
+  else if ( highway=secondary                         ) then  24
+  else if ( highway=secondary_link                    ) then  23
+  else if ( highway=tertiary                          ) then  22
+  else if ( highway=tertiary_link                     ) then  21
+  else if ( highway=unclassified                      ) then  20
+  else if ( isresidentialorliving                     ) then  6
+  else if ( highway=service                           ) then  6
+  else if ( highway=cycleway                          ) then  6
+  else if ( or bicycle=designated bicycle_road=yes    ) then  6
+  else if ( highway=track                             ) then if tracktype=grade1 then 6 else 4
+  else if ( highway=bridleway|road|path|footway       ) then  4
+  else if ( highway=steps                             ) then  2
+  else if ( highway=pedestrian                        ) then  2
+  else 0
+
+assign isbadoneway = not equal onewaypenalty 0
+assign isgoodoneway = if reversedirection=yes then oneway=-1
+                      else if oneway= then junction=roundabout else oneway=yes|true|1
+assign isroundabout = junction=roundabout
+assign islinktype = highway=motorway_link|trunk_link|primary_link|secondary_link|tertiary_link
+assign isgoodforcars = if greater priorityclassifier 6 then true
+                  else if ( or isresidentialorliving highway=service ) then true
+                  else if ( and highway=track tracktype=grade1 ) then true
+                  else false
+
+assign classifiermask add          isbadoneway
+                      add multiply isgoodoneway   2
+                      add multiply isroundabout   4
+                      add multiply islinktype     8
+                          multiply isgoodforcars 16
+
+assign dummyUsage = smoothness=
+
+---context:node  # following code refers to node tags
+
+assign defaultaccess =
+       if ( access= ) then true
+       else if ( access=private|no ) then false
+       else true
+
+assign bikeaccess =
+       if nodeaccessgranted=yes then true
+       else if bicycle= then
+       (
+         if vehicle= then defaultaccess
+         else not vehicle=private|no
+       )
+       else not bicycle=private|no|dismount
+
+assign footaccess =
+       if bicycle=dismount then true
+       else if foot= then defaultaccess
+       else not foot=private|no
+
+assign initialcost =
+       if or highway=traffic_signals and highway=crossing crossing=traffic_signals then 20
+       else
+       if bikeaccess then 0
+       else ( if footaccess then 100 else 1000000 )
+`;
+
+let cycleLanesProfileId = null;
+async function uploadCycleLanesProfile() {
+  const res = await fetch(`${BROUTER}/profile`, { method: "POST", body: CYCLELANES_BRF });
+  if (!res.ok) throw new Error(`couldn't reach the router to set up strict cycle-lane routing (${res.status})`);
+  const data = await res.json();
+  if (data.error || !data.profileid) throw new Error(data.error || "router rejected the cycle-lane profile");
+  return data.profileid;
+}
+
+// Resolves a `#profile` select value to the string BRouter's `profile=`
+// param expects — for the built-in named profiles that's a no-op; for the
+// strict cycling-lanes mode it lazily uploads the custom profile script
+// (once per session) and returns the server-assigned id.
+async function resolveProfileParam(profileValue) {
+  if (profileValue !== CYCLELANES_PROFILE_ID) return profileValue;
+  if (cycleLanesProfileId) return cycleLanesProfileId;
+  cycleLanesProfileId = await uploadCycleLanesProfile();
+  return cycleLanesProfileId;
+}
+
 // Single BRouter call. Returns { coords:[[lon,lat,ele],...], distance:meters }.
 async function routeVia(pts, profile) {
   const lonlats = pts.map((p) => `${p.lon.toFixed(6)},${p.lat.toFixed(6)}`).join("|");
-  const url = `${BROUTER}?lonlats=${lonlats}&profile=${encodeURIComponent(profile)}&alternativeidx=0&format=geojson`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`router returned ${res.status}`);
-  const data = await res.json();
+  const nogos = nogosParam();
+  const nogosQS = nogos ? `&nogos=${encodeURIComponent(nogos)}` : "";
+  let resolvedProfile = await resolveProfileParam(profile);
+  let res, data;
+  try {
+    res = await fetch(`${BROUTER}?lonlats=${lonlats}&profile=${encodeURIComponent(resolvedProfile)}${nogosQS}&alternativeidx=0&format=geojson`);
+    if (!res.ok) throw new Error(`router returned ${res.status}`);
+    data = await res.json();
+  } catch (err) {
+    // The uploaded custom profile may have expired server-side — re-upload once and retry.
+    if (profile === CYCLELANES_PROFILE_ID) {
+      cycleLanesProfileId = null;
+      resolvedProfile = await resolveProfileParam(profile);
+      res = await fetch(`${BROUTER}?lonlats=${lonlats}&profile=${encodeURIComponent(resolvedProfile)}${nogosQS}&alternativeidx=0&format=geojson`);
+      if (!res.ok) throw new Error(`router returned ${res.status}`);
+      data = await res.json();
+    } else throw err;
+  }
   const feature = data.features && data.features[0];
-  if (!feature) throw new Error("no route found");
-  const coords = feature.geometry.coordinates;
+  const coords = feature && feature.geometry.coordinates;
+  if (!feature || !coords || coords.length < 2) {
+    throw new Error(profile === CYCLELANES_PROFILE_ID
+      ? "no dedicated cycle lane connects these points"
+      : "no route found");
+  }
   const distance = parseFloat(feature.properties["track-length"]) || 0;
   const messages = feature.properties.messages || null; // per-segment way tags
   return { coords, distance, messages };
@@ -992,6 +1652,7 @@ async function runRoute() {
     if (seq !== routeSeq) return; // a newer request superseded this one
 
     state.routeCoords = coords; // [lon, lat, ele]
+    state.messages = messages;
     state.snapped = true;
 
     setRoutePolyline(coords.map((c) => [c[1], c[0]]));
@@ -1000,6 +1661,8 @@ async function runRoute() {
     computeStatsFromCoords(coords);
     renderElevation();
     renderSurface(messages);
+    applyRouteColoring();
+    renderMidpoints();
     updateRouteExtras();
     setRouteAvailable(true);
     setStatus(`Snapped to roads · ${(state.distance / 1000).toFixed(1)} km`);
@@ -1017,11 +1680,14 @@ async function runRoute() {
 function drawFallback(pts) {
   state.snapped = false;
   state.routeCoords = pts.map((p) => [p.lon, p.lat]); // no elevation
+  state.messages = null;
   setRoutePolyline([]);
   fallbackLayer.setLatLngs(pts.map((p) => [p.lat, p.lon]));
   computeStatsFromCoords(state.routeCoords);
   renderElevation();
   renderSurface(null);
+  applyRouteColoring();
+  renderMidpoints();
   updateRouteExtras();
   setRouteAvailable(true);
 }
@@ -1041,6 +1707,7 @@ function applyLoadedRoute({ start, waypoints, coords, loop, profile, name, messa
   renderMarkers();
 
   state.routeCoords = coords;
+  state.messages = messages || null;
   state.snapped = true;
   setRoutePolyline(coords.map((c) => [c[1], c[0]]));
   fallbackLayer.setLatLngs([]);
@@ -1048,6 +1715,8 @@ function applyLoadedRoute({ start, waypoints, coords, loop, profile, name, messa
   computeStatsFromCoords(coords);
   renderElevation();
   renderSurface(messages || null);
+  applyRouteColoring();
+  renderMidpoints();
   updateRouteExtras();
   setRouteAvailable(coords.length > 1);
   if (coords.length > 1) map.fitBounds(routeLayer.getBounds(), { padding: [40, 40] });
@@ -2305,6 +2974,8 @@ function savePrefs() {
     pace: el.paceSlider.value,
     theme: document.documentElement.getAttribute("data-theme") || "retro",
     mode: document.documentElement.getAttribute("data-mode") || "retro",
+    basemap: activeBase,
+    routeColorMode,
   };
   try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch {}
 }
@@ -2369,6 +3040,8 @@ function applyPrefs() {
   if (p.pace) { el.paceSlider.value = p.pace; el.paceLabel.textContent = `${paceKmh()} km/h`; }
   setTheme(p.theme || "retro");
   setMode(p.mode || "retro");
+  if (p.basemap) setBasemap(p.basemap);
+  if (p.routeColorMode) setRouteColorMode(p.routeColorMode);
 }
 
 // ---------- Wire up ----------
@@ -2466,6 +3139,13 @@ function bind() {
       moveIndex = -1;
       map.getContainer().classList.remove("moving");
       setStatus("Move cancelled.");
+    }
+    if (e.key === "Escape" && nogoArmMode) {
+      nogoArmMode = false;
+      const b = document.getElementById("mapNogo");
+      if (b) b.classList.remove("active");
+      map.getContainer().classList.remove("nogo-arming");
+      setStatus("Avoid-zone placement cancelled.");
     }
   });
 }

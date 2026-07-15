@@ -379,6 +379,8 @@ button:disabled:hover { border-color: var(--border); background: var(--panel-2);
 .actions button { width: 100%; }
 .save:hover { border-color: var(--go); color: var(--go); }
 
+.import-panel button { width: 100%; }
+
 /* ---------- Road surface breakdown ---------- */
 .surface-bar { display: flex; height: 14px; border-radius: 7px; overflow: hidden; border: 1.5px solid var(--border); background: var(--bg-2); }
 .surf { height: 100%; transition: width .4s ease; }
@@ -488,6 +490,18 @@ footer { margin-top: auto; }
   100% { transform: scale(0) rotate(60deg); opacity: 0; }
 }
 
+/* Drag-to-insert "+" handle at each route segment's midpoint — faint until
+   hovered, so it doesn't compete visually with the numbered waypoints. */
+.mid-marker {
+  display: flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: rgba(255,255,255,.3); border: 2px dashed var(--accent-2);
+  font-size: 12px; font-weight: 800; line-height: 1; color: var(--accent-2);
+  opacity: .5; cursor: grab; transition: opacity .15s ease, transform .15s ease;
+}
+.mid-marker:hover { opacity: 1; transform: scale(1.35); }
+.mid-marker:active { cursor: grabbing; }
+
 /* On-map Undo / Clear controls */
 .map-edit { display: flex; flex-direction: column; gap: 6px; }
 .map-edit button {
@@ -501,6 +515,28 @@ footer { margin-top: auto; }
 @keyframes btn-pop { 40% { transform: scale(1.13); } }
 .map-edit .map-save { border-color: var(--go); color: var(--go); }
 .map-edit .map-save:hover:not(:disabled) { background: var(--go); color: #06231f; border-color: var(--go); }
+
+/* Street / satellite / terrain basemap switcher (stacked under the zoom control) */
+.basemap-toggle { display: flex; flex-direction: column; margin-top: 6px; }
+.basemap-toggle button {
+  background: var(--bg-2); border: 2px solid var(--border); color: var(--text);
+  box-shadow: var(--shadow); width: 34px; height: 34px; font-size: 15px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+}
+.basemap-toggle button + button { border-top: none; }
+.basemap-toggle button:hover { border-color: var(--accent); background: var(--panel); }
+.basemap-toggle button.active { background: var(--accent); border-color: var(--accent); }
+
+/* Team colour / gradient (steepness) / surface route-line colouring switcher */
+.routecolor-toggle { display: flex; flex-direction: column; margin-top: 6px; }
+.routecolor-toggle button {
+  background: var(--bg-2); border: 2px solid var(--border); color: var(--text);
+  box-shadow: var(--shadow); width: 34px; height: 34px; font-size: 15px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+}
+.routecolor-toggle button + button { border-top: none; }
+.routecolor-toggle button:hover { border-color: var(--accent); background: var(--panel); }
+.routecolor-toggle button.active { background: var(--accent); border-color: var(--accent); }
 
 /* On-map wind grid overlay: little streaks of moving air per grid point (not
    static arrow signs), plus a small speed readout — direction, speed AND
@@ -548,6 +584,9 @@ footer { margin-top: auto; }
 
 /* "Click to move" mode */
 .leaflet-container.moving { cursor: crosshair; }
+
+/* "Click to place an avoid-zone" mode */
+.leaflet-container.nogo-arming { cursor: crosshair; }
 
 /* Waypoint Move / Delete popup */
 .wp-popup-wrap .leaflet-popup-content-wrapper {

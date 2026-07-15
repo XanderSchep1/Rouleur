@@ -35,7 +35,7 @@ let moveIndex = -1;     // index of a point armed for click-to-move, or -1
 // ---------- DOM ----------
 const $ = (id) => document.getElementById(id);
 const el = {
-  routeName: $("routeName"), profile: $("profile"), loop: $("loop"),
+  routeName: $("routeName"), profile: $("profile"), loop: $("loop"), autoOrder: $("autoOrder"),
   search: $("search"), searchBtn: $("searchBtn"), locateBtn: $("locateBtn"),
   distance: $("statDistance"), gain: $("statGain"), loss: $("statLoss"), points: $("statPoints"),
   elevation: $("elevation"), elevHint: $("elevHint"), elevOverlay: $("elevOverlay"),
@@ -118,7 +118,7 @@ function initMap() {
     icon: startIcon(), draggable: true, autoPan: true, zIndexOffset: 1000,
   }).addTo(map);
   startMarker.bindTooltip("Ride start — drag me to move it", { direction: "top", offset: [0, -46] });
-  startMarker.on("dragend", () => { bounceStart(); savePrefs(); recalcRoute(); invalidateGenOptions(); });
+  startMarker.on("dragend", () => { bounceStart(); savePrefs(); refreshWaypoints(); invalidateGenOptions(); });
 
   // Map click: relocate a point if one is armed for "move", else add a point.
   map.on("click", (e) => {
@@ -126,8 +126,7 @@ function initMap() {
       state.waypoints[moveIndex] = { lat: e.latlng.lat, lon: e.latlng.lng };
       moveIndex = -1;
       map.getContainer().classList.remove("moving");
-      renderMarkers();
-      recalcRoute();
+      refreshWaypoints();
       setStatus("Point moved.");
     } else {
       addWaypoint(e.latlng.lat, e.latlng.lng);
@@ -284,10 +283,66 @@ function stopGenLoadingAnim() {
 }
 
 // ---------- Waypoints ----------
-function addWaypoint(lat, lon) {
-  state.waypoints.push({ lat, lon });
+// "Round off route" mode: reorders `points` (an array of {lat, lon}) into a
+// short path/loop starting at `anchor`, ignoring the order they were given
+// in — so it doesn't matter what sequence you clicked them in. Nearest-
+// neighbor construction followed by 2-opt refinement (removes crossings);
+// fast and plenty good for the handful of points a rider places by hand.
+function orderPointsByProximity(anchor, points, closeLoop) {
+  if (points.length < 2) return points.slice();
+
+  const dist = (a, b) => haversine(a.lat, a.lon, b.lat, b.lon);
+
+  const remaining = points.slice();
+  const order = [];
+  let cur = anchor;
+  while (remaining.length) {
+    let bi = 0, bd = Infinity;
+    for (let i = 0; i < remaining.length; i++) {
+      const d = dist(cur, remaining[i]);
+      if (d < bd) { bd = d; bi = i; }
+    }
+    cur = remaining.splice(bi, 1)[0];
+    order.push(cur);
+  }
+
+  const tourLen = (seq) => {
+    let d = dist(anchor, seq[0]);
+    for (let i = 1; i < seq.length; i++) d += dist(seq[i - 1], seq[i]);
+    if (closeLoop) d += dist(seq[seq.length - 1], anchor);
+    return d;
+  };
+
+  let best = order;
+  let bestLen = tourLen(best);
+  let improved = true;
+  let guard = 0;
+  while (improved && guard++ < 200) {
+    improved = false;
+    for (let i = 0; i < best.length - 1 && !improved; i++) {
+      for (let j = i + 1; j < best.length; j++) {
+        const next = best.slice(0, i).concat(best.slice(i, j + 1).reverse(), best.slice(j + 1));
+        const len = tourLen(next);
+        if (len < bestLen - 1e-6) { best = next; bestLen = len; improved = true; break; }
+      }
+    }
+  }
+  return best;
+}
+
+// Re-renders + re-routes after any waypoint edit, auto-arranging the points
+// first when "Round off route" is on.
+function refreshWaypoints() {
+  if (el.autoOrder.checked && state.waypoints.length >= 2) {
+    state.waypoints = orderPointsByProximity(startPoint(), state.waypoints, el.loop.checked);
+  }
   renderMarkers();
   recalcRoute();
+}
+
+function addWaypoint(lat, lon) {
+  state.waypoints.push({ lat, lon });
+  refreshWaypoints();
 }
 
 // The START pin is the first point; state.waypoints are the *following* points
@@ -313,7 +368,7 @@ function renderMarkers() {
     marker.on("dragend", (e) => {
       const ll = e.target.getLatLng();
       state.waypoints[i] = { lat: ll.lat, lon: ll.lng };
-      recalcRoute();
+      refreshWaypoints();
     });
     marker.on("contextmenu", () => deleteWaypoint(i)); // right-click = quick delete
     bindWaypointPopup(marker, i);                       // click = Move / Delete popup
@@ -354,8 +409,7 @@ function deleteWaypoint(i) {
 
 function removeWaypoint(i) {
   state.waypoints.splice(i, 1);
-  renderMarkers();
-  recalcRoute();
+  refreshWaypoints();
 }
 
 function undo() {
@@ -2245,6 +2299,7 @@ function savePrefs() {
     routeName: el.routeName.value,
     profile: el.profile.value,
     loop: el.loop.checked,
+    autoOrder: el.autoOrder.checked,
     genDist: el.genDist.value,
     useNetwork: el.useNetwork.checked,
     pace: el.paceSlider.value,
@@ -2308,6 +2363,7 @@ function applyPrefs() {
   if (p.routeName != null) el.routeName.value = p.routeName;
   if (p.profile) el.profile.value = p.profile;
   if (typeof p.loop === "boolean") el.loop.checked = p.loop;
+  if (typeof p.autoOrder === "boolean") el.autoOrder.checked = p.autoOrder;
   if (typeof p.useNetwork === "boolean") el.useNetwork.checked = p.useNetwork;
   if (p.genDist) syncGenDist(parseFloat(p.genDist));
   if (p.pace) { el.paceSlider.value = p.pace; el.paceLabel.textContent = `${paceKmh()} km/h`; }
@@ -2341,7 +2397,8 @@ function bind() {
     if (file) importGPXFile(file);
   });
   el.profile.addEventListener("change", recalcRoute);
-  el.loop.addEventListener("change", () => { renderMarkers(); recalcRoute(); });
+  el.loop.addEventListener("change", refreshWaypoints);
+  el.autoOrder.addEventListener("change", refreshWaypoints);
   el.searchBtn.addEventListener("click", search);
   el.search.addEventListener("keydown", (e) => { if (e.key === "Enter") search(); });
   el.locateBtn.addEventListener("click", locate);
@@ -2400,6 +2457,7 @@ function bind() {
   el.routeName.addEventListener("input", scheduleSavePrefs);
   el.profile.addEventListener("change", scheduleSavePrefs);
   el.loop.addEventListener("change", scheduleSavePrefs);
+  el.autoOrder.addEventListener("change", scheduleSavePrefs);
   el.useNetwork.addEventListener("change", scheduleSavePrefs);
 
   document.addEventListener("keydown", (e) => {
